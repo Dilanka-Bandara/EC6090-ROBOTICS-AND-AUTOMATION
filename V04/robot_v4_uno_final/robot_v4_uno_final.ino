@@ -122,10 +122,10 @@
 #define DETECT_DIST       18
 
 // Motor speeds (0–255 PWM)
-#define BASE_SPEED      78     // normal line following 155
-#define SHARP_SPEED       50   // max speed on sharp turns 100
-#define AVOID_SPEED       70   // obstacle bypass 140
-#define CREEP_SPEED       50   // slow approach for pickup 100
+#define BASE_SPEED      155     // normal line following 155
+#define SHARP_SPEED       100   // max speed on sharp turns 100
+#define AVOID_SPEED       140   // obstacle bypass 140
+#define CREEP_SPEED       100   // slow approach for pickup 100
 
 // PD Controller — tune on actual arena
 // If robot wobbles → reduce Kp
