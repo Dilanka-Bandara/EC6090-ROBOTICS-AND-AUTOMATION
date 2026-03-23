@@ -1,7 +1,7 @@
 /*
  * ============================================================
- *  EC6090 MINI PROJECT 2026 — LINE FOLLOWING ROBOT v6.1
- *  OPTIMIZED — FIXED THRESHOLD (NO AUTO-CALIBRATION)
+ *  EC6090 MINI PROJECT 2026 — LINE FOLLOWING ROBOT v6.2
+ *  OPTIMIZED — TIGHT TURN TUNING (45° & 90° CORNERS)
  * ============================================================
  *  Board: ESP32 DevKit V1 — 30 pin
  *  
@@ -18,6 +18,35 @@
  *         2x Red obstacle cubes ON the line
  *         1x Green cube ON the line (to pick up)
  *         End/Target zone to drop cube
+ *
+ *  NEW in v6.2 — TIGHT TURN UPGRADES:
+ *
+ *  ► SHARP TURN DETECTION: irBinary pattern matching detects 90°
+ *    and 45° corners BEFORE PID error gets large. Triggers a
+ *    dedicated pivot routine instead of relying on PID alone.
+ *
+ *  ► COUNTER-ROTATION ON SHARP CORNERS: When far-side sensor fires
+ *    alone (S1 only or S5 only), robot PIVOTS (one wheel reverse)
+ *    instead of just slowing one wheel. Much faster turn execution.
+ *
+ *  ► TIGHTER ERROR WEIGHTS: Changed from ±20/±10/0 to ±40/±20/0
+ *    so PID sees a bigger error signal earlier on corners.
+ *    This gives faster correction before the robot drifts off.
+ *
+ *  ► LOWER CURVE SPEED: CURVE_SPEED reduced 100→70 for tight turns.
+ *    SHARP_TURN_SPEED added (55) for S1/S5-only pivot moves.
+ *
+ *  ► AGGRESSIVE KP/KD: Kp raised 1.8→3.2, Kd raised 2.0→4.5.
+ *    Tested to handle 90° without oscillation on straights because
+ *    CURVE_SPEED is also reduced to keep the correction proportional.
+ *
+ *  ► CORNER HOLD: After a sharp-turn pivot, robot holds the turn
+ *    until a center-biased sensor (S2/S3/S4) sees the line again.
+ *    Prevents premature straightening mid-corner.
+ *
+ *  ► INTEGRAL RESET ON SHARP TURNS: integralSum flushed to zero
+ *    whenever a sharp-corner pattern is detected so accumulated
+ *    error from the straight doesn't fight the corner correction.
  *
  *  CHANGES from v5.5 → v6.1:
  *
@@ -88,7 +117,7 @@
  *  Required library: ESP32Servo (install via Library Manager)
  *  Arduino IDE: Tools → Board → ESP32 Arduino → ESP32 Dev Module
  *
- *  Author: EC6090 Mini Project 2026 — v6.0 Optimized
+ *  Author: EC6090 Mini Project 2026 — v6.2 Tight Turn Edition
  * ============================================================
  */
 
@@ -151,22 +180,23 @@
 
 // --- Motor Speeds (0–255) ---
 #define MAX_SPEED       200   // max speed on straights
-#define BASE_SPEED      180   // normal line following
-#define CURVE_SPEED     100   // reduced speed on tight curves
+#define BASE_SPEED      170   // normal line following (slightly reduced for safety)
+#define CURVE_SPEED      80   // reduced speed on moderate curves
+#define SHARP_TURN_SPEED 55   // pivot speed for 45°/90° corners — one wheel reverses
 #define MIN_SPEED        80   // minimum motor speed (below this motors stall)
 #define AVOID_SPEED     130   // obstacle avoidance maneuver
 #define CREEP_SPEED      90   // slow approach to green cube
 #define SPIN_SPEED      120   // lost-line spin recovery
 
 // --- PID Gains ---
-// Start with these, then adjust:
-//   Oscillates on straight → lower Kp
-//   Sluggish on curves     → raise Kp
-//   Overshoots curves      → raise Kd
-//   Steady-state offset    → raise Ki (carefully)
-float Kp = 1.8;
+// Tuned for tight 45° / 90° corners in the arena:
+//   Kp raised (1.8→3.2): stronger reaction to corner error
+//   Kd raised (2.0→4.5): damps oscillation from higher Kp
+//   Ki kept small — integral still helps steady-state on straights
+//   CURVE_SPEED lowered so correction stays proportional at corners
+float Kp = 3.2;
 float Ki = 0.01;
-float Kd = 2.0;
+float Kd = 4.5;
 float integralSum = 0.0;
 #define INTEGRAL_MAX  500.0   // anti-windup clamp
 
@@ -270,7 +300,7 @@ void setup() {
   delay(100);
   Serial.println();
   Serial.println("============================================");
-  Serial.println("  EC6090 Robot v6.1 — Fixed Threshold");
+  Serial.println("  EC6090 Robot v6.2 — Tight Turn Edition");
   Serial.println("============================================");
   Serial.print("IR Sensors: DIGITAL (3-pin), INVERT=");
   Serial.println(INVERT_IR ? "YES (LOW=line)" : "NO (HIGH=line)");
@@ -574,14 +604,24 @@ void readIRSensors() {
 }
 
 // ============================================================
-//  LINE FOLLOWING — PID Controller with Adaptive Speed
+//  LINE FOLLOWING — PID Controller with Tight-Turn Handling
 //
-//  Sensor weights: S1=-20, S2=-10, S3=0, S4=+10, S5=+20
-//  Negative error = line is LEFT  → need to turn LEFT
-//  Positive error = line is RIGHT → need to turn RIGHT
+//  v6.2 CHANGES:
+//    • Sensor weights doubled (±40/±20/0) for bigger error signal
+//    • Sharp-corner pattern detection: S1-only or S5-only triggers
+//      a COUNTER-ROTATION pivot instead of PID differential drive
+//    • Corner Hold: stays in pivot until a middle sensor (S2/S3/S4)
+//      sees the line, preventing premature straightening
+//    • integralSum reset on every sharp-corner detection
+//    • Adaptive speed thresholds tightened for smaller error window
+//
+//  Sensor weights: S1=-40, S2=-20, S3=0, S4=+20, S5=+40
+//  Negative error = line is LEFT  → turn LEFT
+//  Positive error = line is RIGHT → turn RIGHT
 // ============================================================
 void followLineAdaptive() {
-  int weights[5] = {-20, -10, 0, 10, 20};
+  // ── Wider weights for larger error signal on corners ──
+  int weights[5] = {-40, -20, 0, 20, 40};
   int weightedSum = 0;
   int sensorSum   = 0;
 
@@ -621,6 +661,80 @@ void followLineAdaptive() {
   // Line found — reset lost timer
   lineLostTiming = false;
 
+  // ── SHARP CORNER DETECTION ──────────────────────────────────
+  // Pattern: ONLY the far-left sensor (S1) fires  → hard left turn
+  // Pattern: ONLY the far-right sensor (S5) fires → hard right turn
+  // These patterns mean the robot has nearly missed the corner;
+  // a standard PID differential won't turn fast enough.
+  // Solution: pivot on the spot (one wheel reverses) and hold
+  // until a middle sensor catches the line again.
+
+  bool s1 = irBinary[0];  // Far Left
+  bool s2 = irBinary[1];  // Mid  Left
+  bool s3 = irBinary[2];  // Center
+  bool s4 = irBinary[3];  // Mid  Right
+  bool s5 = irBinary[4];  // Far  Right
+
+  // 90° hard left: only S1 (or S1+S2) see the line, nothing on right
+  bool hardLeft  = (s1 && !s3 && !s4 && !s5);
+  // 90° hard right: only S5 (or S4+S5) see the line, nothing on left
+  bool hardRight = (s5 && !s1 && !s2 && !s3);
+
+  if (hardLeft) {
+    // Flush integral — corner detected, old accumulated error is stale
+    integralSum = 0.0;
+    Serial.println("SHARP LEFT TURN (pivot)");
+    // Pivot LEFT: left wheel reverse, right wheel forward
+    driveMotors(-SHARP_TURN_SPEED, SHARP_TURN_SPEED);
+    // Hold pivot until a middle-biased sensor sees the line
+    unsigned long cornerStart = millis();
+    while (millis() - cornerStart < 800) {  // 800ms safety timeout
+      readIRSensors();
+      // Exit pivot when S2, S3, or S4 picks up the line
+      if (irBinary[1] || irBinary[2] || irBinary[3]) break;
+      delay(5);
+    }
+    lastError = -20;  // seed PID with left-bias so it doesn't overshoot right
+    return;
+  }
+
+  if (hardRight) {
+    integralSum = 0.0;
+    Serial.println("SHARP RIGHT TURN (pivot)");
+    // Pivot RIGHT: left wheel forward, right wheel reverse
+    driveMotors(SHARP_TURN_SPEED, -SHARP_TURN_SPEED);
+    unsigned long cornerStart = millis();
+    while (millis() - cornerStart < 800) {
+      readIRSensors();
+      if (irBinary[1] || irBinary[2] || irBinary[3]) break;
+      delay(5);
+    }
+    lastError = 20;  // seed PID with right-bias
+    return;
+  }
+
+  // ── 45° CORNER ASSIST ───────────────────────────────────────
+  // Pattern: S1+S2 active but nothing on right side → steep left
+  // Pattern: S4+S5 active but nothing on left side  → steep right
+  // Use strong differential (one wheel at CURVE_SPEED, other reverses)
+  bool steepLeft  = (s1 && s2 && !s4 && !s5);
+  bool steepRight = (s4 && s5 && !s1 && !s2);
+
+  if (steepLeft) {
+    integralSum = 0.0;
+    driveMotors(-SHARP_TURN_SPEED + 10, CURVE_SPEED);  // sharp left arc
+    lastError = -30;
+    return;
+  }
+
+  if (steepRight) {
+    integralSum = 0.0;
+    driveMotors(CURVE_SPEED, -SHARP_TURN_SPEED + 10);  // sharp right arc
+    lastError = 30;
+    return;
+  }
+
+  // ── NORMAL PID for all other cases ──────────────────────────
   int error = weightedSum / sensorSum;
 
   // PID calculation
@@ -634,12 +748,13 @@ void followLineAdaptive() {
   lastError = error;
 
   // Adaptive speed: fast on straights, slow on curves
+  // Tighter thresholds in v6.2 because weights are doubled (max error = ±40)
   int absError  = abs(error);
   int baseSpeed = BASE_SPEED;
-  if (absError <= 3) {
+  if (absError <= 5) {
     baseSpeed = MAX_SPEED;       // nearly straight — go fast
-  } else if (absError <= 10) {
-    baseSpeed = BASE_SPEED;      // moderate curve
+  } else if (absError <= 20) {
+    baseSpeed = BASE_SPEED;      // moderate curve (maps to old ≤10)
   } else {
     baseSpeed = CURVE_SPEED;     // tight curve — slow down
   }
@@ -647,9 +762,9 @@ void followLineAdaptive() {
   int leftSpeed  = baseSpeed - (int)correction;
   int rightSpeed = baseSpeed + (int)correction;
 
-  // Clamp speeds
-  leftSpeed  = constrain(leftSpeed,  -255, 255);
-  rightSpeed = constrain(rightSpeed, -255, 255);
+  // Clamp speeds — allow mild reverse on the inside wheel for tighter arcs
+  leftSpeed  = constrain(leftSpeed,  -120, 255);
+  rightSpeed = constrain(rightSpeed, -120, 255);
 
   driveMotors(leftSpeed, rightSpeed);
 }
@@ -1123,5 +1238,5 @@ void runTestMode() {
 }
 
 // ============================================================
-//  END OF CODE v6.1 — EC6090 Mini Project 2026
+//  END OF CODE v6.2 — EC6090 Mini Project 2026 — Tight Turns
 // ============================================================

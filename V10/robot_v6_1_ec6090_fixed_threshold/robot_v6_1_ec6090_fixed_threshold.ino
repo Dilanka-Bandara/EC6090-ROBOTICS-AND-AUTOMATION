@@ -100,11 +100,11 @@
 //  Set ALL to false for normal autonomous operation
 // ============================================================
 #define TEST_MOTORS       false   // test motor directions & PWM
-#define TEST_IR_RAW       true   // print raw IR values continuously
+#define TEST_IR_RAW       false   // print raw IR values continuously
 #define TEST_COLOR        false   // print color sensor values
 #define TEST_ULTRASONIC   false   // print distance continuously
 #define TEST_SERVO        false   // sweep servo back and forth
-#define CALIBRATE_COLOR   false   // run color calibration routine
+#define CALIBRATE_COLOR   true   // run color calibration routine
 #define PRINT_DEBUG       true    // print state/sensor dashboard at 10Hz
 
 // ============================================================
