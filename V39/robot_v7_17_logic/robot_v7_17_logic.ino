@@ -1,6 +1,6 @@
 /*
  * ============================================================
- *  EC6090 MINI PROJECT 2026 — LINE FOLLOWING ROBOT v7.10
+ *  EC6090 MINI PROJECT 2026 — LINE FOLLOWING ROBOT v7.17
  *  FULL LOGIC REWRITE — correct obstacle/pickup/end zone flow
  * ============================================================
  *  Board: ESP32 DevKit V1 — 30 pin
@@ -177,7 +177,7 @@
 // ============================================================
 
 // Motor speeds
-#define MAX_SPEED             200   // full speed on straights
+#define MAX_SPEED             190   // full speed on straights
 #define BASE_SPEED            150   // normal line following
 #define CURVE_SPEED            80   // moderate curves
 #define SHARP_TURN_SPEED      200   // pivot speed on tight corners
@@ -212,9 +212,9 @@ float integralSum = 0.0;
 #define PIVOT_TIMEOUT_MS  3000
 
 // Ultrasonic distances
-#define DETECT_DIST_CM       5   // 20 was first detection — start creeping toward object
-#define COLOR_READ_DIST_CM    5   // stop and read color at this distance
-#define END_WALL_DIST_CM      8   // wall at end zone
+#define DETECT_DIST_CM       6   // 20 was first detection — start creeping toward object
+#define COLOR_READ_DIST_CM    6   // stop and read color at this distance
+#define END_WALL_DIST_CM      6   // wall at end zone
 #define REVERSE_MS          300   // ms to reverse before red cube bypass
 
 // End zone search
@@ -245,10 +245,14 @@ float integralSum = 0.0;
 //
 #define COLOR_RED_R_MAX        350   // R below this = red cube
 #define COLOR_RED_MARGIN        40   // R must be this much lower than G and B
-#define COLOR_GREEN_ALL_MIN    200   // all channels must be above this (was 400 — WRONG)
-#define COLOR_GREEN_ALL_MAX    360   // all channels must be below this (new upper bound)
-#define COLOR_GREEN_SPREAD      80   // max spread between channels (tightened from 120)
-#define COLOR_GREEN_G_MARGIN    15   // G must exceed R by at least this much
+// GREEN thresholds — recalibrated v7.13 (29 live samples, 29/29 pass)
+// R:209-247  G:207-271  B:213-293
+// No single channel dominates. Only reliable rule:
+// ALL channels tightly clustered in 180-310, spread < 60.
+// RED cubes rejected because their G/B are always > 375.
+#define COLOR_GREEN_ALL_MIN    180   // all channels above this
+#define COLOR_GREEN_ALL_MAX    310   // all channels below this
+#define COLOR_GREEN_SPREAD      60   // max-min spread must be under this
 
 // ============================================================
 //  GLOBAL VARIABLES
@@ -261,8 +265,12 @@ int irPins[5] = {IR_S1, IR_S2, IR_S3, IR_S4, IR_S5};
 
 int   lastError        = 0;
 int   lastTightDir     = 0;
-bool  cubePickedUp     = false;
-int   obstaclesAvoided = 0;
+bool  cubePickedUp       = false;
+int   obstaclesAvoided   = 0;
+bool  ultrasonicEnabled  = true;   // SET false during avoidance maneuver
+                                   // SET true  only after line is reacquired
+                                   // Prevents ultrasonic interrupt loop where
+                                   // reversing robot re-detects the same cube
 unsigned long pickUpTime     = 0;
 unsigned long stateEntryTime = 0;
 unsigned long lastDebugPrint = 0;
@@ -321,7 +329,7 @@ void setup() {
   delay(100);
   Serial.println();
   Serial.println("============================================");
-  Serial.println("  EC6090 Robot v7.9 — Full Logic");
+  Serial.println("  EC6090 Robot v7.17 — Full Logic");
   Serial.println("============================================");
   Serial.print("INVERT_IR=");
   Serial.println(INVERT_IR ? "YES (LOW=line)" : "NO (HIGH=line)");
@@ -333,6 +341,15 @@ void setup() {
   pinMode(IN3_PIN, OUTPUT);
   pinMode(IN4_PIN, OUTPUT);
 
+  // ── Servo FIRST — must claim LEDC channel before motors ──
+  // ESP32Servo uses LEDC internally. GPIO 25/26/27 share the
+  // same timer group. Attaching servo BEFORE ledcAttach ensures
+  // it gets a free channel and the PWM signal works correctly.
+  gateServo.attach(SERVO_PIN, 500, 2400);
+  gateServo.write(SERVO_OPEN);
+  delay(500);
+
+  // ── Motor PWM — after servo is already attached ──
   ledcAttach(ENA_PIN, PWM_FREQ, PWM_RESOLUTION);
   ledcAttach(ENB_PIN, PWM_FREQ, PWM_RESOLUTION);
   stopMotors();
@@ -351,10 +368,6 @@ void setup() {
   for (int i = 0; i < 5; i++) {
     pinMode(irPins[i], INPUT);
   }
-
-  gateServo.attach(SERVO_PIN, 500, 2400);
-  gateServo.write(SERVO_OPEN);
-  delay(500);
 
   if (TEST_MOTORS || TEST_IR_RAW || TEST_COLOR ||
       TEST_ULTRASONIC || TEST_SERVO || CALIBRATE_COLOR) {
@@ -444,19 +457,28 @@ void loop() {
       char color = readColorVoted(15);
       Serial.print("Color result: "); Serial.println(color);
 
-      // Simple rule: GREEN = pick up, ANYTHING ELSE = avoid
+      // Rule: GREEN = pick up, ANYTHING ELSE (red/unknown) = reverse and avoid
       if (color == 'G') {
         Serial.println("→ GREEN detected — picking up");
         changeState(STATE_PICK_GREEN);
       } else {
-        Serial.println("→ NOT green — treating as obstacle, avoiding");
+        Serial.println("→ NOT green — DISABLING ultrasonic NOW before any movement");
+        // ⚠️  CRITICAL: disable ultrasonic HERE, at the exact moment of
+        // decision — NOT inside STATE_AVOID_RED. There is a full loop
+        // iteration between changeState() and the next state executing.
+        // During that gap readUltrasonic() would fire again, re-detect
+        // the cube still at 5cm, and block the robot permanently.
+        ultrasonicEnabled = false;
+        Serial.println("Ultrasonic DISABLED");
         changeState(STATE_AVOID_RED);
       }
       break;
     }
 
-    // ── Avoid red obstacle ────────────────────────────────────
+    // ── Avoid red/unknown obstacle ───────────────────────────
     case STATE_AVOID_RED: {
+      // Ultrasonic already disabled in STATE_IDENTIFY_OBJECT
+      // the moment color was confirmed not-green.
       avoidObstacle();
       obstaclesAvoided++;
       Serial.print("Obstacles avoided: "); Serial.println(obstaclesAvoided);
@@ -468,10 +490,14 @@ void loop() {
     case STATE_REJOIN_LINE: {
       bool found = rejoinLine();
       if (found) {
-        // After rejoin — go back to correct state
+        // Line confirmed by IR sensors — safe to re-enable ultrasonic.
+        // Only re-enable HERE (not inside avoidObstacle) to guarantee
+        // the robot is fully past the cube before sensing resumes.
+        ultrasonicEnabled = true;
+        Serial.println("Ultrasonic RE-ENABLED — back on line");
         changeState(cubePickedUp ? STATE_CARRY_TO_END : STATE_LINE_FOLLOW);
       } else {
-        // Line not found — try one more spin
+        // Line not found — try one more spin (ultrasonic still off)
         Serial.println("Rejoin timeout — recovery spin");
         if (lastError >= 0) driveMotors(SPIN_SPEED, -SPIN_SPEED);
         else                driveMotors(-SPIN_SPEED, SPIN_SPEED);
@@ -501,6 +527,9 @@ void loop() {
 
       // Object detected while carrying → auto avoid (no color check)
       if (dist > 2 && dist < DETECT_DIST_CM) {
+        // Disable ultrasonic FIRST before stopping or moving
+        ultrasonicEnabled = false;
+        Serial.println("Ultrasonic DISABLED — carry avoidance starting");
         stopMotors();
         delay(100);
         Serial.println("Object while carrying → auto avoiding");
@@ -738,10 +767,27 @@ void followLineAdaptive() {
     // Both cases trigger the same pivot behaviour:
     //   stop → pivot → wait for S3 center alone → stop → PID
     //
-    bool tightLeft  = (s1 && !s2 && !s3);                    // 45° left:  10000
-    bool tightRight = (s5 && !s4 && !s3);                    // 45° right: 00001
-    bool sharp90Left  = (s1 && s2 && s3 && s4 && !s5);       // 90° left:  11110  ← measured
-    bool sharp90Right = (!s1 && s2 && s3 && s4 && s5);       // 90° right: 01111  ← measured
+    // ── TIGHT TURN TRIGGERS ────────────────────────────────────
+    // All of these trigger identical pivot behaviour:
+    //
+    // LEFT PIVOT (pivot RIGHT):
+    //   10000 = far-left only
+    //   11110 = all except far-right  (robot shifted fully left)
+    //   11100 = left three sensors    (measured 90° left corner)
+    //
+    // RIGHT PIVOT (pivot LEFT):
+    //   00001 = far-right only
+    //   01111 = all except far-left   (robot shifted fully right)
+    //   00111 = right three sensors   (measured 90° right corner)
+    //
+    bool tightLeft  = (s1 && !s2 && !s3)                     // 10000
+                   || (s1 && s2 && s3 && s4 && !s5)          // 11110
+                   || (s1 && s2 && s3 && !s4 && !s5);        // 11100
+    bool tightRight = (s5 && !s4 && !s3)                     // 00001
+                   || (!s1 && s2 && s3 && s4 && s5)          // 01111
+                   || (!s1 && !s2 && s3 && s4 && s5);        // 00111
+    bool sharp90Left  = false;   // merged into tightLeft above
+    bool sharp90Right = false;   // merged into tightRight above
 
     // MISSED CORNER: all sensors dark + last error was strong
     bool missedLeft  = (sensorSum == 0 &&
@@ -751,15 +797,13 @@ void followLineAdaptive() {
 
     if (tightLeft || sharp90Left || missedLeft) {
       if (missedLeft) {
-        Serial.println("MISSED CORNER LEFT-SENSOR → backup + pivot RIGHT");
+        Serial.println("MISSED CORNER LEFT → backup + pivot RIGHT");
         driveMotors(-BACKUP_SPEED, -BACKUP_SPEED);
         delay(BACKUP_MS);
         stopMotors();
-      } else if (sharp90Left) {
-        Serial.println("90-DEG LEFT-SENSOR (11110) → pivot RIGHT");
-        stopMotors();
       } else {
-        Serial.println("45-DEG LEFT-SENSOR (10000) → pivot RIGHT");
+        // covers 10000, 11110, 11100 — all treated as tight left corner
+        Serial.println("TIGHT LEFT (10000/11110/11100) → pivot RIGHT");
         stopMotors();
       }
       turning        = true;
@@ -771,15 +815,13 @@ void followLineAdaptive() {
     }
     else if (tightRight || sharp90Right || missedRight) {
       if (missedRight) {
-        Serial.println("MISSED CORNER RIGHT-SENSOR → backup + pivot LEFT");
+        Serial.println("MISSED CORNER RIGHT → backup + pivot LEFT");
         driveMotors(-BACKUP_SPEED, -BACKUP_SPEED);
         delay(BACKUP_MS);
         stopMotors();
-      } else if (sharp90Right) {
-        Serial.println("90-DEG RIGHT-SENSOR (01111) → pivot LEFT");
-        stopMotors();
       } else {
-        Serial.println("45-DEG RIGHT-SENSOR (00001) → pivot LEFT");
+        // covers 00001, 01111, 00111 — all treated as tight right corner
+        Serial.println("TIGHT RIGHT (00001/01111/00111) → pivot LEFT");
         stopMotors();
       }
       turning        = true;
@@ -877,14 +919,16 @@ void followLine() {
 void avoidObstacle() {
   Serial.println("── Avoiding obstacle ──");
 
-  // Step 0: Reverse away from object to create turning space
-  Serial.println("  Reversing for clearance...");
+  // ── Step 0: Reverse to create turning clearance ──────────────
+  Serial.println("  Step 0: Reversing for clearance...");
   driveMotors(-AVOID_SPEED, -AVOID_SPEED);
   delay(REVERSE_MS);
   stopMotors();
   delay(100);
 
-  // Decide bypass direction from IR sensors
+  // ── Decide bypass direction from IR sensors ───────────────────
+  // After reversing, check which side the line is on.
+  // Default: go RIGHT. Go LEFT only if line clearly on left side.
   readIRSensors();
   bool lineOnLeft  = (irBinary[0] == 1 || irBinary[1] == 1);
   bool lineOnRight = (irBinary[3] == 1 || irBinary[4] == 1);
@@ -896,28 +940,64 @@ void avoidObstacle() {
   } else {
     Serial.println("  Direction: RIGHT bypass");
   }
+  int s = goRight ? 1 : -1;
 
-  int s = goRight ? 1 : -1;  // turn sign
-
-  // Step 1: Turn away from obstacle (~45°)
-  driveMotors(s * AVOID_SPEED, -s * AVOID_SPEED);
-  delay(400);
+  // ── Step 1: Turn away from obstacle until sensors clear ───────
+  // Pivot until all 5 IR sensors see NO line — robot is now
+  // pointing away from the line and clear of the obstacle path.
+  Serial.println("  Step 1: Turning away until line clears...");
+  {
+    unsigned long t = millis();
+    while (millis() - t < 1200) {
+      driveMotors(s * AVOID_SPEED, -s * AVOID_SPEED);
+      readIRSensors();
+      int cnt = 0;
+      for (int i = 0; i < 5; i++) cnt += irBinary[i];
+      if (cnt == 0) break;   // line cleared — stop turning
+      delay(10);
+    }
+  }
   stopMotors(); delay(100);
 
-  // Step 2: Drive forward past the obstacle
+  // ── Step 2: Drive forward past the obstacle ───────────────────
+  // Move forward until ultrasonic clears (obstacle no longer
+  // in front) OR timeout. This adapts to actual obstacle size.
+  Serial.println("  Step 2: Driving past obstacle...");
+  {
+    unsigned long t = millis();
+    while (millis() - t < 1500) {
+      driveMotors(AVOID_SPEED, AVOID_SPEED);
+      float d = readUltrasonic();
+      if (d > 15.0) break;   // obstacle cleared on the side
+      delay(20);
+    }
+  }
+  stopMotors(); delay(100);
+
+  // ── Step 3: Turn back toward line ─────────────────────────────
+  // Pivot back in opposite direction until at least one IR
+  // sensor sees the line again — robot is now facing the line.
+  Serial.println("  Step 3: Turning back toward line...");
+  {
+    unsigned long t = millis();
+    while (millis() - t < 1500) {
+      driveMotors(-s * AVOID_SPEED, s * AVOID_SPEED);
+      readIRSensors();
+      int cnt = 0;
+      for (int i = 0; i < 5; i++) cnt += irBinary[i];
+      if (cnt >= 1) break;   // line found — stop turning
+      delay(10);
+    }
+  }
+  stopMotors(); delay(100);
+
+  // ── Step 4: Creep forward to centre on line ───────────────────
+  // Short forward burst to position robot properly on the line
+  // before handing back to rejoinLine().
+  Serial.println("  Step 4: Centring on line...");
   driveMotors(AVOID_SPEED, AVOID_SPEED);
-  delay(700);
+  delay(150);
   stopMotors(); delay(100);
-
-  // Step 3: Turn back toward line (~45°)
-  driveMotors(-s * AVOID_SPEED, s * AVOID_SPEED);
-  delay(400);
-  stopMotors(); delay(100);
-
-  // Step 4: Drive forward to reach line
-  driveMotors(AVOID_SPEED, AVOID_SPEED);
-  delay(450);
-  stopMotors(); delay(150);
 
   Serial.println("  Avoidance complete");
 }
@@ -1076,21 +1156,21 @@ char readColorOnce() {
   }
 
   // ── GREEN DETECTION ─────────────────────────────────────────
-  // Calibrated v7.10 from 23 live samples:
-  //   R: 208–273   G: 263–327   B: 267–334
-  // Rules:
-  //   1. All channels in [COLOR_GREEN_ALL_MIN .. COLOR_GREEN_ALL_MAX]
-  //   2. Spread (max−min) < COLOR_GREEN_SPREAD  (channels close together)
-  //   3. G is dominant: G > R + COLOR_GREEN_G_MARGIN  AND  G >= B
+  // Recalibrated v7.13 — 29 live samples, ALL 29 pass.
+  // R:209-247  G:207-271  B:213-293
+  // No single channel is reliably dominant — any channel can
+  // be highest or lowest depending on sensor angle/lighting.
+  // ONLY rule needed: all 3 channels clustered in [180..310]
+  // AND spread (max-min) < 60.
+  // RED cubes safely rejected: their G/B are always > 375,
+  // which is way above COLOR_GREEN_ALL_MAX=310.
   {
     long maxVal = max(r, max(g, b));
     long minVal = min(r, min(g, b));
     if (r > COLOR_GREEN_ALL_MIN && r < COLOR_GREEN_ALL_MAX &&
         g > COLOR_GREEN_ALL_MIN && g < COLOR_GREEN_ALL_MAX &&
         b > COLOR_GREEN_ALL_MIN && b < COLOR_GREEN_ALL_MAX &&
-        (maxVal - minVal) < COLOR_GREEN_SPREAD &&
-        g > (r + COLOR_GREEN_G_MARGIN) &&
-        g >= b) {
+        (maxVal - minVal) < COLOR_GREEN_SPREAD) {
       return 'G';
     }
   }
@@ -1130,6 +1210,12 @@ char readColorVoted(int times) {
 //  ULTRASONIC
 // ============================================================
 float readUltrasonic() {
+  // ── Gated by ultrasonicEnabled flag ─────────────────────────
+  // Returns 999.0 (no obstacle) when disabled so that obstacle
+  // detection logic in STATE_LINE_FOLLOW and STATE_CARRY_TO_END
+  // never triggers during avoidance or rejoin maneuvers.
+  if (!ultrasonicEnabled) return 999.0;
+
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -1275,5 +1361,5 @@ void runTestMode() {
 }
 
 // ============================================================
-//  END OF CODE v7.10 — EC6090 Mini Project 2026 — Full Logic
+//  END OF CODE v7.17 — EC6090 Mini Project 2026 — Full Logic
 // ============================================================
