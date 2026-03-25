@@ -1,6 +1,6 @@
 /*
  * ============================================================
- *  EC6090 MINI PROJECT 2026 — LINE FOLLOWING ROBOT v7.9
+ *  EC6090 MINI PROJECT 2026 — LINE FOLLOWING ROBOT v7.11
  *  FULL LOGIC REWRITE — correct obstacle/pickup/end zone flow
  * ============================================================
  *  Board: ESP32 DevKit V1 — 30 pin
@@ -20,7 +20,14 @@
  *         End/Target zone to drop cube
  *
  * ============================================================
- *  CHANGES FROM v7.8 → v7.9
+ *  CHANGES FROM v7.8 → v7.9 → v7.10
+ * ============================================================
+ *  v7.10 — GREEN CUBE THRESHOLDS RECALIBRATED (23 live samples)
+ *    Old: ALL_MIN=400, SPREAD=120 → cube was NEVER detected
+ *    New: ALL_MIN=200, ALL_MAX=360, SPREAD=80, G_MARGIN=15
+ *    R:208-273  G:263-327  B:267-334 — G is dominant channel
+ * ============================================================
+ *
  * ============================================================
  *
  *  1. CLOSE-APPROACH BEFORE COLOR READ:
@@ -122,8 +129,8 @@
 #define TEST_IR_RAW       false
 #define TEST_COLOR        false
 #define TEST_ULTRASONIC   false
-#define TEST_SERVO        false 
-#define CALIBRATE_COLOR   true
+#define TEST_SERVO        false
+#define CALIBRATE_COLOR   false
 #define PRINT_DEBUG       true
 
 // ============================================================
@@ -205,9 +212,9 @@ float integralSum = 0.0;
 #define PIVOT_TIMEOUT_MS  3000
 
 // Ultrasonic distances
-#define DETECT_DIST_CM       5   // 20 was first detection — start creeping toward object
-#define COLOR_READ_DIST_CM    5   // stop and read color at this distance
-#define END_WALL_DIST_CM      8   // wall at end zone
+#define DETECT_DIST_CM       6   // 20 was first detection — start creeping toward object
+#define COLOR_READ_DIST_CM    6   // stop and read color at this distance
+#define END_WALL_DIST_CM      6   // wall at end zone
 #define REVERSE_MS          300   // ms to reverse before red cube bypass
 
 // End zone search
@@ -231,15 +238,17 @@ float integralSum = 0.0;
 // RED cube measured:   R=273–342, G=375–440, B=369–452
 //   Signature: R is clearly the LOWEST channel (by 40+ points)
 //
-// GREEN cube measured: R=406–512, G=421–493, B=433–539
-//   Signature: ALL channels are HIGH (above 400) — no dominant
-//   channel. The cube reflects diffusely. Detection rule:
-//   all channels > 400 AND max channel - min channel < 120
+// GREEN cube measured (v7.10 — live calibration, 23 samples):
+//   R: 208–273   G: 263–327   B: 267–334
+//   Signature: ALL channels in range [200–360], spread < 80,
+//   AND G is dominant (G > R+15  AND  G >= B)
 //
-#define COLOR_RED_R_MAX      350   // R below this = red cube
-#define COLOR_RED_MARGIN      40   // R must be this much lower than G and B
-#define COLOR_GREEN_ALL_MIN  400   // all channels must be above this for green
-#define COLOR_GREEN_SPREAD   120   // max spread between channels for green
+#define COLOR_RED_R_MAX        350   // R below this = red cube
+#define COLOR_RED_MARGIN        40   // R must be this much lower than G and B
+#define COLOR_GREEN_ALL_MIN    200   // all channels must be above this (was 400 — WRONG)
+#define COLOR_GREEN_ALL_MAX    360   // all channels must be below this (new upper bound)
+#define COLOR_GREEN_SPREAD      80   // max spread between channels (tightened from 120)
+#define COLOR_GREEN_G_MARGIN    15   // G must exceed R by at least this much
 
 // ============================================================
 //  GLOBAL VARIABLES
@@ -312,7 +321,7 @@ void setup() {
   delay(100);
   Serial.println();
   Serial.println("============================================");
-  Serial.println("  EC6090 Robot v7.9 — Full Logic");
+  Serial.println("  EC6090 Robot v7.11 — Full Logic");
   Serial.println("============================================");
   Serial.print("INVERT_IR=");
   Serial.println(INVERT_IR ? "YES (LOW=line)" : "NO (HIGH=line)");
@@ -324,6 +333,15 @@ void setup() {
   pinMode(IN3_PIN, OUTPUT);
   pinMode(IN4_PIN, OUTPUT);
 
+  // ── Servo FIRST — must claim LEDC channel before motors ──
+  // ESP32Servo uses LEDC internally. GPIO 25/26/27 share the
+  // same timer group. Attaching servo BEFORE ledcAttach ensures
+  // it gets a free channel and the PWM signal works correctly.
+  gateServo.attach(SERVO_PIN, 500, 2400);
+  gateServo.write(SERVO_OPEN);
+  delay(500);
+
+  // ── Motor PWM — after servo is already attached ──
   ledcAttach(ENA_PIN, PWM_FREQ, PWM_RESOLUTION);
   ledcAttach(ENB_PIN, PWM_FREQ, PWM_RESOLUTION);
   stopMotors();
@@ -342,10 +360,6 @@ void setup() {
   for (int i = 0; i < 5; i++) {
     pinMode(irPins[i], INPUT);
   }
-
-  gateServo.attach(SERVO_PIN, 500, 2400);
-  gateServo.write(SERVO_OPEN);
-  delay(500);
 
   if (TEST_MOTORS || TEST_IR_RAW || TEST_COLOR ||
       TEST_ULTRASONIC || TEST_SERVO || CALIBRATE_COLOR) {
@@ -1067,17 +1081,21 @@ char readColorOnce() {
   }
 
   // ── GREEN DETECTION ─────────────────────────────────────────
-  // Green cube reflects diffusely — no single channel dominates.
-  // All channels are HIGH (above 400) and spread is small (<120).
-  // This separates green from red (R is low on red) and from
-  // background/floor (floor values are much lower overall).
+  // Calibrated v7.10 from 23 live samples:
+  //   R: 208–273   G: 263–327   B: 267–334
+  // Rules:
+  //   1. All channels in [COLOR_GREEN_ALL_MIN .. COLOR_GREEN_ALL_MAX]
+  //   2. Spread (max−min) < COLOR_GREEN_SPREAD  (channels close together)
+  //   3. G is dominant: G > R + COLOR_GREEN_G_MARGIN  AND  G >= B
   {
     long maxVal = max(r, max(g, b));
     long minVal = min(r, min(g, b));
-    if (r > COLOR_GREEN_ALL_MIN &&
-        g > COLOR_GREEN_ALL_MIN &&
-        b > COLOR_GREEN_ALL_MIN &&
-        (maxVal - minVal) < COLOR_GREEN_SPREAD) {
+    if (r > COLOR_GREEN_ALL_MIN && r < COLOR_GREEN_ALL_MAX &&
+        g > COLOR_GREEN_ALL_MIN && g < COLOR_GREEN_ALL_MAX &&
+        b > COLOR_GREEN_ALL_MIN && b < COLOR_GREEN_ALL_MAX &&
+        (maxVal - minVal) < COLOR_GREEN_SPREAD &&
+        g > (r + COLOR_GREEN_G_MARGIN) &&
+        g >= b) {
       return 'G';
     }
   }
@@ -1262,5 +1280,5 @@ void runTestMode() {
 }
 
 // ============================================================
-//  END OF CODE v7.9 — EC6090 Mini Project 2026 — Full Logic
+//  END OF CODE v7.11 — EC6090 Mini Project 2026 — Full Logic
 // ============================================================
